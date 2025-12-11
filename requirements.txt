@@ -1,0 +1,7 @@
+torch==2.5.1+cu118
+plyfile
+tqdm
+matplotlib
+torchmetrics==1.2.0
+opencv_python
+scipy

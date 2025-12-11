@@ -41,14 +41,18 @@ opacity = opacity * compensation[:, None]
 ## ✅ Full implementation
 ### 📦 Installation
 We provide an installation using Conda package and environment management:
-```
+```shell
 git clone https://github.com/DCVL-3D/DropGaussian_release
 cd DropGaussian_release
-conda env create --file environment.yaml
+conda create -y -n DropGaussian python=3.10
 conda activate DropGaussian
-```
 
-**Note:** This Conda environment assumes that **CUDA 12.1** is already installed on your system.
+pip install torch==2.5.1 torchvision==0.20.1 torchaudio==2.5.1 --index-url https://download.pytorch.org/whl/cu118
+pip install -r requirements.txt
+
+pip install --no-build-isolation submodules/diff-gaussian-rasterization
+pip install --no-build-isolation submodules/simple-knn
+```
 
 ### 🗂️ Data Preparation
 
@@ -87,22 +91,22 @@ You can download them via the link below:
 
 To train on a single LLFF scene, use the following command:
 
-```
+```shell
 python train.py -s ${DATASET_PATH} -m ${OUTPUT_PATH} --eval -r 8 --n_views {3 or 6 or 9}
 ```
 To train and evaluate on **all LLFF scenes**, simply run the script below:
-```
+```shell
 bash scripts/train_llff.sh
 ```
 #### 🔹 MipNeRF-360 Dataset
 
 To train on a single MipNeRF-360 scene, use the following command:
 
-```
+```shell
 python train.py -s ${DATASET_PATH} -m ${OUTPUT_PATH} --eval -r 8 --n_views {12 or 24}
 ```
 To train and evaluate on **all MipNeRF-360 scenes**, simply run the script below:
-```
+```shell
 bash scripts/train_mipnerf360.sh
 ```
 
