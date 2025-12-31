@@ -24,7 +24,8 @@ def parse_resolution(value: str) -> tuple[int, int]:
 
 
 def needs_preparation(scene_dir: Path) -> bool:
-    return not (scene_dir / "transforms_train.json").exists() or not (scene_dir / "transforms_test.json").exists()
+    required = ["transforms_train.json", "transforms_test.json", "points3d.ply"]
+    return any(not (scene_dir / name).exists() for name in required)
 
 
 def run_command(cmd: list[str]) -> None:
@@ -48,11 +49,17 @@ def main() -> None:
     parser.add_argument("--resolution", type=parse_resolution, default="112x200", help="Image resolution HxW")
     parser.add_argument("--iterations", type=int, default=10000, help="Override optimization iterations")
     parser.add_argument("--experiment-name", type=str, default="omniscene", help="Experiment folder under output/")
+    parser.add_argument(
+        "--force-rand-pcd",
+        action="store_true",
+        help="强制在 train.py 中启用 --rand_pcd，用于调试或当深度文件缺失时手动退化。",
+    )
     args = parser.parse_args()
 
     OUTPUT_ROOT.mkdir(parents=True, exist_ok=True)
-    prepared_root = PREPARED_ROOT
-    args.experiment_name = f"{args.experiment_name}_{args.resolution[0]}x{args.resolution[1]}"
+    resolution_tag = f"{args.resolution[0]}x{args.resolution[1]}"
+    prepared_root = PREPARED_ROOT / resolution_tag
+    args.experiment_name = f"{args.experiment_name}_{resolution_tag}"
     experiment_root = OUTPUT_ROOT / args.experiment_name
     prepared_root.mkdir(parents=True, exist_ok=True)
     experiment_root.mkdir(parents=True, exist_ok=True)
@@ -79,8 +86,9 @@ def main() -> None:
             "1",
             "--n_views",
             "6",
-            "--rand_pcd",
         ]
+        if args.force_rand_pcd:
+            train_cmd.append("--rand_pcd")
         if iteration_str:
             train_cmd.extend(["--iterations", iteration_str])
         run_command(train_cmd)

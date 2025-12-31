@@ -13,6 +13,7 @@ from plyfile import PlyData, PlyElement
 
 
 StageLiteral = Literal["train", "val", "test", "demo"]
+DEPTH_CONFIDENCE_THRESHOLD = 0.3
 
 
 def _ensure_image_tensor(img: torch.Tensor) -> torch.Tensor:
@@ -25,6 +26,68 @@ def _save_image(tensor: torch.Tensor, path: Path) -> None:
     tensor = _ensure_image_tensor(tensor)
     arr = (tensor.permute(1, 2, 0).numpy() * 255.0).round().astype(np.uint8)
     Image.fromarray(arr).save(path)
+
+
+def _replace_suffix(path: str, new_suffix: str) -> str:
+    root, _ = os.path.splitext(path)
+    return root + new_suffix
+
+
+def _resolve_relative_depth_path(img_path: str) -> str:
+    rel_path = img_path.replace("samples_small", "samples_dpt_small")
+    rel_path = rel_path.replace("sweeps_small", "sweeps_dpt_small")
+    return _replace_suffix(rel_path, ".npy")
+
+
+def _resolve_metric_depth_paths(img_path: str) -> Tuple[str, str]:
+    metric_path = img_path.replace("samples_small", "samples_dptm_small")
+    metric_path = metric_path.replace("sweeps_small", "sweeps_dptm_small")
+    depth_path = _replace_suffix(metric_path, "_dpt.npy")
+    conf_path = _replace_suffix(metric_path, "_conf.npy")
+    return depth_path, conf_path
+
+
+def _load_npy_with_resize(path: str, target_reso: Tuple[int, int]) -> Tuple[np.ndarray, bool]:
+    target_h, target_w = target_reso
+    if not os.path.exists(path):
+        print(f"[OmniScene] 缺失文件：{path}")
+        return np.zeros((target_h, target_w), dtype=np.float32), False
+    data = np.load(path).astype(np.float32)
+    if data.shape[0] != target_h or data.shape[1] != target_w:
+        data_img = Image.fromarray(data)
+        data_img = data_img.resize((target_w, target_h), resample=Image.BILINEAR)
+        data = np.array(data_img, dtype=np.float32)
+    return data, True
+
+
+def _load_relative_depth_map(path: str, target_reso: Tuple[int, int]) -> Tuple[np.ndarray, bool]:
+    disp, ok = _load_npy_with_resize(path, target_reso)
+    if not ok or not np.any(disp):
+        return np.zeros(target_reso, dtype=np.float32), False
+    max_disp = float(np.max(disp))
+    min_disp = float(np.min(disp))
+    denom = max(min_disp + 1e-3, 1e-3)
+    value_range = min(max_disp / denom, 50.0)
+    min_clamped = max_disp / max(value_range, 1e-3)
+    depth = 1.0 / np.maximum(disp, min_clamped)
+    depth_min = depth.min()
+    depth_max = depth.max()
+    if depth_max - depth_min > 1e-6:
+        depth = (depth - depth_min) / (depth_max - depth_min)
+    else:
+        depth = np.zeros_like(depth)
+    return depth.astype(np.float32), True
+
+
+def _load_metric_depth_and_confidence(
+    depth_path: str,
+    conf_path: str,
+    target_reso: Tuple[int, int],
+) -> Tuple[np.ndarray, np.ndarray, bool]:
+    depth_map, depth_ok = _load_npy_with_resize(depth_path, target_reso)
+    conf_map, conf_ok = _load_npy_with_resize(conf_path, target_reso)
+    conf_map = np.clip(conf_map, 0.0, 1.0)
+    return depth_map, conf_map, depth_ok and conf_ok
 
 
 @dataclass
@@ -43,6 +106,10 @@ class OmniSceneView:
     c2w: torch.Tensor
     intrinsics: torch.Tensor
     metadata: ViewMetadata
+    depth_metric: Optional[torch.Tensor] = None
+    depth_confidence: Optional[torch.Tensor] = None
+    depth_valid_mask: Optional[torch.Tensor] = None
+    depth_relative: Optional[torch.Tensor] = None
 
 
 @dataclass
@@ -89,9 +156,23 @@ def load_conditions(
     reso: Tuple[int, int],
     *,
     is_input: bool,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, List[ViewMetadata]]:
+    load_relative_depth: bool = False,
+    confidence_threshold: float = DEPTH_CONFIDENCE_THRESHOLD,
+) -> Tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    List[ViewMetadata],
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    Optional[torch.Tensor],
+]:
 
     imgs, masks, intrinsics, metadata = [], [], [], []
+    metric_depths, depth_confs, depth_valids = [], [], []
+    relative_depths: Optional[List[np.ndarray]]
+    relative_depths = [] if load_relative_depth else None
     target_h, target_w = reso
 
     for path in img_paths:
@@ -108,6 +189,19 @@ def load_conditions(
         ck_norm = ck_scaled.copy()
         ck_norm[0, :] /= target_w
         ck_norm[1, :] /= target_h
+
+        metric_depth_path, conf_path = _resolve_metric_depth_paths(img_path)
+        metric_depth, conf_map, _ = _load_metric_depth_and_confidence(metric_depth_path, conf_path, reso)
+        valid_mask = (conf_map >= confidence_threshold) & np.isfinite(metric_depth) & (metric_depth > 0.0)
+
+        metric_depths.append(metric_depth)
+        depth_confs.append(conf_map)
+        depth_valids.append(valid_mask.astype(np.float32))
+
+        if relative_depths is not None:
+            rel_path = _resolve_relative_depth_path(img_path)
+            rel_depth, _ = _load_relative_depth_map(rel_path, reso)
+            relative_depths.append(rel_depth)
 
         imgs.append(arr)
         intrinsics.append(ck_norm)
@@ -138,7 +232,22 @@ def load_conditions(
     imgs_tensor = torch.from_numpy(np.stack(imgs, axis=0)).permute(0, 3, 1, 2).float() / 255.0
     masks_tensor = torch.from_numpy(np.stack(masks, axis=0)).bool()
     intr_tensor = torch.from_numpy(np.stack(intrinsics, axis=0))
-    return imgs_tensor, masks_tensor, intr_tensor, metadata
+    depth_metric_tensor = torch.from_numpy(np.stack(metric_depths, axis=0))
+    depth_conf_tensor = torch.from_numpy(np.stack(depth_confs, axis=0))
+    depth_valid_tensor = torch.from_numpy(np.stack(depth_valids, axis=0)).bool()
+    relative_depth_tensor = (
+        torch.from_numpy(np.stack(relative_depths, axis=0)).float() if relative_depths is not None else None
+    )
+    return (
+        imgs_tensor,
+        masks_tensor,
+        intr_tensor,
+        metadata,
+        depth_metric_tensor,
+        depth_conf_tensor,
+        depth_valid_tensor,
+        relative_depth_tensor,
+    )
 
 
 class OmniSceneDataset:
@@ -214,10 +323,26 @@ class OmniSceneDataset:
             input_paths.append(self._replace_prefix(img_path))
             input_c2w.append(c2w)
 
-        input_imgs, input_masks, input_intr, input_meta = load_conditions(
-            input_paths, self.resolution, is_input=True
+        (
+            input_imgs,
+            _input_masks,
+            input_intr,
+            input_meta,
+            input_depth_metric,
+            input_depth_conf,
+            input_depth_valid,
+            input_depth_relative,
+        ) = load_conditions(input_paths, self.resolution, is_input=True)
+        context_views = self._pack_views(
+            input_imgs,
+            input_c2w,
+            input_intr,
+            input_meta,
+            depth_metric=input_depth_metric,
+            depth_confidence=input_depth_conf,
+            depth_valid_mask=input_depth_valid,
+            depth_relative=input_depth_relative,
         )
-        context_views = self._pack_views(input_imgs, input_c2w, input_intr, input_meta)
 
         output_paths, output_c2w = [], []
         frame_num = len(bin_info["sensor_info"]["LIDAR_TOP"])
@@ -229,10 +354,26 @@ class OmniSceneDataset:
                 output_paths.append(self._replace_prefix(img_path))
                 output_c2w.append(c2w)
 
-        out_imgs, out_masks, out_intr, out_meta = load_conditions(
-            output_paths, self.resolution, is_input=False
+        (
+            out_imgs,
+            _out_masks,
+            out_intr,
+            out_meta,
+            out_depth_metric,
+            out_depth_conf,
+            out_depth_valid,
+            out_depth_relative,
+        ) = load_conditions(output_paths, self.resolution, is_input=False)
+        output_views = self._pack_views(
+            out_imgs,
+            output_c2w,
+            out_intr,
+            out_meta,
+            depth_metric=out_depth_metric,
+            depth_confidence=out_depth_conf,
+            depth_valid_mask=out_depth_valid,
+            depth_relative=out_depth_relative,
         )
-        output_views = self._pack_views(out_imgs, output_c2w, out_intr, out_meta)
 
         # Append context views to targets for evaluation parity
         output_views.extend(context_views)
@@ -244,6 +385,10 @@ class OmniSceneDataset:
         c2ws: List[np.ndarray],
         intrinsics: torch.Tensor,
         metadata: List[ViewMetadata],
+        depth_metric: Optional[torch.Tensor] = None,
+        depth_confidence: Optional[torch.Tensor] = None,
+        depth_valid_mask: Optional[torch.Tensor] = None,
+        depth_relative: Optional[torch.Tensor] = None,
     ) -> List[OmniSceneView]:
         views: List[OmniSceneView] = []
         for idx in range(images.shape[0]):
@@ -253,6 +398,10 @@ class OmniSceneDataset:
                     c2w=torch.from_numpy(c2ws[idx].astype(np.float32)),
                     intrinsics=intrinsics[idx],
                     metadata=metadata[idx],
+                    depth_metric=depth_metric[idx] if depth_metric is not None else None,
+                    depth_confidence=depth_confidence[idx] if depth_confidence is not None else None,
+                    depth_valid_mask=depth_valid_mask[idx] if depth_valid_mask is not None else None,
+                    depth_relative=depth_relative[idx] if depth_relative is not None else None,
                 )
             )
         return views
@@ -262,11 +411,64 @@ def compute_camera_angle_x(meta: ViewMetadata) -> float:
     return 2.0 * math.atan((meta.width / 2.0) / max(meta.fx, 1e-6))
 
 
-def save_random_point_cloud(path: Path, num_points: int = 10000) -> None:
+def _extract_points_from_view(
+    view: OmniSceneView,
+    confidence_threshold: float = DEPTH_CONFIDENCE_THRESHOLD,
+) -> Optional[Tuple[np.ndarray, np.ndarray]]:
+    if view.depth_metric is None or view.depth_confidence is None:
+        return None
+    depth = view.depth_metric.detach().cpu().numpy()
+    conf = view.depth_confidence.detach().cpu().numpy()
+    valid = (conf >= confidence_threshold) & np.isfinite(depth) & (depth > 0.0)
+    if view.depth_valid_mask is not None:
+        valid &= view.depth_valid_mask.detach().cpu().numpy()
+    if not np.any(valid):
+        return None
+    ys, xs = np.nonzero(valid)
+    depths = depth[ys, xs]
+    fx, fy, cx, cy = view.metadata.fx, view.metadata.fy, view.metadata.cx, view.metadata.cy
+    xs = xs.astype(np.float32)
+    ys = ys.astype(np.float32)
+    depths = depths.astype(np.float32)
+    px = (xs - cx) * depths / max(fx, 1e-6)
+    py = (ys - cy) * depths / max(fy, 1e-6)
+    cam_points = np.stack([px, py, depths], axis=-1)
+    ones = np.ones((cam_points.shape[0], 1), dtype=np.float32)
+    cam_points_h = np.concatenate([cam_points, ones], axis=1)
+    c2w = view.c2w.detach().cpu().numpy().astype(np.float32)
+    world_points = (c2w @ cam_points_h.T).T[:, :3]
+    colors = (view.image.detach().cpu().permute(1, 2, 0).numpy() * 255.0).astype(np.float32)
+    rgb = colors[ys.astype(int), xs.astype(int)]
+    return world_points, rgb
+
+
+def generate_point_cloud_from_views(
+    views: Sequence[OmniSceneView],
+    confidence_threshold: float = DEPTH_CONFIDENCE_THRESHOLD,
+) -> Optional[Tuple[np.ndarray, np.ndarray]]:
+    points_list, colors_list = [], []
+    for view in views:
+        result = _extract_points_from_view(view, confidence_threshold)
+        if result is None:
+            continue
+        pts, cols = result
+        points_list.append(pts)
+        colors_list.append(cols)
+    if not points_list:
+        return None
+    points = np.concatenate(points_list, axis=0)
+    colors = np.concatenate(colors_list, axis=0)
+    return points.astype(np.float32), colors.astype(np.float32)
+
+
+def save_point_cloud(path: Path, xyz: np.ndarray, colors: np.ndarray) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    xyz = np.random.rand(num_points, 3).astype(np.float32) * 2.0 - 1.0
-    normals = np.zeros_like(xyz)
-    colors = np.random.rand(num_points, 3).astype(np.float32)
+    xyz = xyz.astype(np.float32)
+    normals = np.zeros_like(xyz, dtype=np.float32)
+    color_arr = colors.astype(np.float32)
+    if color_arr.max() <= 1.0:
+        color_arr = color_arr * 255.0
+    color_arr = np.clip(color_arr, 0.0, 255.0)
     dtype = [
         ("x", "f4"),
         ("y", "f4"),
@@ -278,11 +480,17 @@ def save_random_point_cloud(path: Path, num_points: int = 10000) -> None:
         ("green", "u1"),
         ("blue", "u1"),
     ]
-    attributes = np.concatenate((xyz, normals, colors * 255.0), axis=1)
-    elements = np.empty(num_points, dtype=dtype)
+    attributes = np.concatenate((xyz, normals, color_arr), axis=1)
+    elements = np.empty(xyz.shape[0], dtype=dtype)
     elements[:] = list(map(tuple, attributes))
     vertex_element = PlyElement.describe(elements, "vertex")
     PlyData([vertex_element]).write(path)
+
+
+def save_random_point_cloud(path: Path, num_points: int = 10000) -> None:
+    xyz = np.random.rand(num_points, 3).astype(np.float32) * 2.0 - 1.0
+    colors = np.random.rand(num_points, 3).astype(np.float32)
+    save_point_cloud(path, xyz, colors * 255.0)
 
 
 def prepare_scene_directory(sample: OmniSceneSample, scene_dir: Path) -> None:
@@ -323,4 +531,10 @@ def prepare_scene_directory(sample: OmniSceneSample, scene_dir: Path) -> None:
 
     ply_path = scene_dir / "points3d.ply"
     if not ply_path.exists():
-        save_random_point_cloud(ply_path)
+        generated = generate_point_cloud_from_views(sample.context)
+        if generated is None:
+            print(f"[Prepare] 未从深度生成点云，回退为随机初始化：{scene_dir}")
+            save_random_point_cloud(ply_path)
+        else:
+            points, colors = generated
+            save_point_cloud(ply_path, points, colors)
