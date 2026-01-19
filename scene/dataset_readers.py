@@ -274,7 +274,9 @@ def readNerfSyntheticInfo(path, white_background, eval, rand_pcd, extension=".pn
     test_cam_infos = readCamerasFromTransforms(path, "transforms_test.json", white_background, extension)
     
     if eval:
-        train_cam_infos = [c for idx, c in enumerate(train_cam_infos) if idx in [2, 16, 26, 55, 73, 76, 86, 93]]
+        # 对于 OmniScene 仅有 6 张训练图的情况，不进行固定索引子采样
+        if len(train_cam_infos) >= 94:
+            train_cam_infos = [c for idx, c in enumerate(train_cam_infos) if idx in [2, 16, 26, 55, 73, 76, 86, 93]]
         eval_cam_infos = [c for idx, c in enumerate(test_cam_infos)]
         test_cam_infos = test_cam_infos
     else:
@@ -359,4 +361,3 @@ sceneLoadTypeCallbacks = {
     "Blender" : readNerfSyntheticInfo,
     "Replica" : readReplicaSceneInfo
 }
-
