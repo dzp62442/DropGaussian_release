@@ -1,4 +1,5 @@
 import argparse
+import json
 import subprocess
 import sys
 from pathlib import Path
@@ -7,7 +8,12 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from comp_svfgs.dataset_omniscene import OmniSceneDataset, OmniSceneSample, prepare_scene_directory
+from comp_svfgs.dataset_omniscene import (
+    OMNISCENE_PREPARED_FORMAT_VERSION,
+    OmniSceneDataset,
+    OmniSceneSample,
+    prepare_scene_directory,
+)
 
 
 OUTPUT_ROOT = REPO_ROOT / "output"
@@ -25,7 +31,16 @@ def parse_resolution(value: str) -> tuple[int, int]:
 
 def needs_preparation(scene_dir: Path) -> bool:
     required = ["transforms_train.json", "transforms_test.json", "points3d.ply"]
-    return any(not (scene_dir / name).exists() for name in required)
+    if any(not (scene_dir / name).exists() for name in required):
+        return True
+    try:
+        for name in ("transforms_train.json", "transforms_test.json"):
+            transforms = json.loads((scene_dir / name).read_text())
+            if transforms.get("omniscene_prepared_format_version") != OMNISCENE_PREPARED_FORMAT_VERSION:
+                return True
+    except (OSError, json.JSONDecodeError):
+        return True
+    return False
 
 
 def run_command(cmd: list[str]) -> None:

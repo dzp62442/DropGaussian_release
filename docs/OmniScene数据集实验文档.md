@@ -57,7 +57,7 @@
 - **转换步骤**（单个 bin）：
   1. 使用 loader 读取 `context/target`。
   2. 将 6 张输入图像保存到 `images/train/`，18 张评估图像保存到 `images/test/`。路径命名统一为 `000.png` 开始的 3 位编号。
-  3. 组装 `transforms_train.json`、`transforms_test.json`：仿照 Blender 数据结构写入 `file_path`（相对路径）、`transform_matrix`（使用 `c2w`）、`camera_angle_x`（可由内参 fx/宽换算），并在 `frames` 字段中列出所有视图。
+  3. 组装 `transforms_train.json`、`transforms_test.json`：仿照 Blender 数据结构写入 `file_path`（相对路径）、`transform_matrix`（将 OpenCV `c2w` 右乘 `diag(1,-1,-1,1)` 转成 Blender/OpenGL 相机轴）、`camera_angle_x`（可由内参 fx/宽换算），并在 `frames` 字段中列出所有视图。
   4. **深度驱动的点云生成**：不再使用随机点。基于每张输入图像的绝对深度与置信度，执行以下流程得到真实尺度点云：  
      - 对每个像素 `(u,v)`，若 `depth_confidence(u,v) > 0.3`，将度量深度 `d` 配合未归一化的内参 `(fx, fy, cx, cy)` 反投影为相机坐标 `(x = (u-cx)*d/fx, y = (v-cy)*d/fy, z=d)`；  
      - 使用对应视图的 `c2w` 将坐标转换到世界坐标系，并将 RGB 取自图像同一像素；  

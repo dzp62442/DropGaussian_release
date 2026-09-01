@@ -14,6 +14,7 @@ from plyfile import PlyData, PlyElement
 
 StageLiteral = Literal["train", "val", "test", "demo"]
 DEPTH_CONFIDENCE_THRESHOLD = 0.3
+OMNISCENE_PREPARED_FORMAT_VERSION = 2
 
 
 def _ensure_image_tensor(img: torch.Tensor) -> torch.Tensor:
@@ -411,6 +412,16 @@ def compute_camera_angle_x(meta: ViewMetadata) -> float:
     return 2.0 * math.atan((meta.width / 2.0) / max(meta.fx, 1e-6))
 
 
+def opencv_c2w_to_blender(c2w: torch.Tensor) -> torch.Tensor:
+    """Convert an OpenCV C2W pose to Blender/OpenGL camera axes."""
+    if c2w.shape != (4, 4):
+        raise ValueError(f"Expect c2w with shape (4,4), got {tuple(c2w.shape)}")
+    flip_yz = torch.eye(4, dtype=c2w.dtype, device=c2w.device)
+    flip_yz[1, 1] = -1
+    flip_yz[2, 2] = -1
+    return c2w @ flip_yz
+
+
 def _extract_points_from_view(
     view: OmniSceneView,
     confidence_threshold: float = DEPTH_CONFIDENCE_THRESHOLD,
@@ -496,8 +507,16 @@ def save_random_point_cloud(path: Path, num_points: int = 10000) -> None:
 def prepare_scene_directory(sample: OmniSceneSample, scene_dir: Path) -> None:
     train_dir = scene_dir / "train"
     test_dir = scene_dir / "test"
-    transforms_train = {"camera_angle_x": compute_camera_angle_x(sample.context[0].metadata), "frames": []}
-    transforms_test = {"camera_angle_x": compute_camera_angle_x(sample.target[0].metadata), "frames": []}
+    transforms_train = {
+        "omniscene_prepared_format_version": OMNISCENE_PREPARED_FORMAT_VERSION,
+        "camera_angle_x": compute_camera_angle_x(sample.context[0].metadata),
+        "frames": [],
+    }
+    transforms_test = {
+        "omniscene_prepared_format_version": OMNISCENE_PREPARED_FORMAT_VERSION,
+        "camera_angle_x": compute_camera_angle_x(sample.target[0].metadata),
+        "frames": [],
+    }
 
     train_dir.mkdir(parents=True, exist_ok=True)
     test_dir.mkdir(parents=True, exist_ok=True)
@@ -509,7 +528,7 @@ def prepare_scene_directory(sample: OmniSceneSample, scene_dir: Path) -> None:
         transforms_train["frames"].append(
             {
                 "file_path": f"train/{stem}",
-                "transform_matrix": view.c2w.tolist(),
+                "transform_matrix": opencv_c2w_to_blender(view.c2w).tolist(),
             }
         )
 
@@ -520,7 +539,7 @@ def prepare_scene_directory(sample: OmniSceneSample, scene_dir: Path) -> None:
         transforms_test["frames"].append(
             {
                 "file_path": f"test/{stem}",
-                "transform_matrix": view.c2w.tolist(),
+                "transform_matrix": opencv_c2w_to_blender(view.c2w).tolist(),
             }
         )
 
