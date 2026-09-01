@@ -41,8 +41,8 @@ def render_set(model_path, name, iteration, views, gaussians, pipeline, backgrou
         gt = view.original_image[0:3, :, :].cuda()
         render_pkg = render(view, gaussians, pipeline, background)
         rendering = render_pkg["render"]
-        torchvision.utils.save_image(rendering, os.path.join(render_path, '{0:05d}'.format(idx) + ".png"))
-        torchvision.utils.save_image(gt, os.path.join(gts_path, '{0:05d}'.format(idx) + ".png"))
+        torchvision.utils.save_image(rendering, os.path.join(render_path, view.image_name + ".png"))
+        torchvision.utils.save_image(gt, os.path.join(gts_path, view.image_name + ".png"))
         PSNR.append(psnr(rendering.unsqueeze(0), gt.unsqueeze(0)))
         SSIM.append(ssim(rendering.unsqueeze(0), gt.unsqueeze(0)))
         LPIPS.append(lpips(rendering.unsqueeze(0), gt.unsqueeze(0), net_type='vgg'))
