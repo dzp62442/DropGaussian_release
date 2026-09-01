@@ -1,4 +1,4 @@
-# OmniScene 数据集实验计划
+# OmniScene 数据集实验说明
 
 本说明文档基于 `depthsplat/docs/OmniScene数据集实验文档.md` 与其对应的数据加载实现整理，阐述在 **DropGaussian（逐场景优化 3DGS）** 中适配 OmniScene（nuScenes 派生）数据集的整体方案。重点描述与 `depthsplat` 前馈式高斯重建的差异、需要新增的代码目录以及数据/流程规划。
 
@@ -38,12 +38,13 @@
 
 ## 4. 数据预处理与场景组织
 ### 4.1 数据加载模块 (`comp_svfgs/dataset_omniscene.py`)
-- **API 设计**：提供 `OmniSceneBinLoader(mode="val")`，默认 `val`，支持 `train/test/demo` four modes 以保持与 depthsplat 一致。
+- **API 设计**：提供 `OmniSceneDataset(mode="val")`，默认 `val`，支持 `train/val/test/demo/center150` 五种模式。
 - **取样策略**：
   - `val`：读取 `bins_val_3.2m.json` 并执行 `self.bin_tokens = bins[:30000:3000][:10]`，得到 10 个 bin，每个 bin 在 DropGaussian 中视作单独场景。
   - `train`：可完整遍历全量训练 bin，后续如需扩展可复用。
   - `test`：保持 depthsplat 中 `0::14` 的 mini-test 抽样。
   - `demo`：沿用 `bins_dynamic_demo`。
+  - `center150`：只负责读取由 SVF-GS 主项目统一生成的 `bins_center150_v1.json`，并保持其中的样本顺序；该清单从 nuScenes 官方 val 的 150 个场景中各选一个 lower median 中央 bin。本项目不提供生成或修改清单的功能。
 - **返回数据**：与 depthsplat 相同的 `context/target` 结构，`context` 6 视角、`target` 18 视角。`load_conditions` 直接复制 depthsplat 版本，包括路径替换与掩码读取。
 - **绝对尺度深度与置信度**：参考 `~/Projects/SVF-GS/data/transforms/loading.py` 将 `Metric3D-v2` 生成的 `_dpt.npy`（绝对深度）与 `_conf.npy`（置信度）加载到 `OmniSceneView` 中。读取流程与 SVF-GS 保持一致：  
   1. 将 `samples_small/*.jpg`（或 `sweeps_small/*.jpg`）映射到 `samples_dptm_small/*_dpt.npy`、`samples_dptm_small/*_conf.npy`；  
@@ -70,36 +71,54 @@
 
 ---
 
-## 5. 训练 / 渲染 / 评估脚本设计
-- 在 `scripts/` 下新增 `run_omniscene.py`（使用 Python，便于管理流程和日志），整体 **单阶段** 完成“场景预检查→必要的预处理→训练→渲染→评估”。流程：
+## 5. 训练 / 渲染 / 评估流程
+- `scripts/run_omniscene.py` 整体 **单阶段** 完成“场景预检查→必要的预处理→训练→渲染→评估”。流程：
   1. 调用 `comp_svfgs.dataset_omniscene` 获取指定模式的 bin 列表；遍历每个 bin 时先检查 `output/omniscene_prepared/XX_<token>/` 是否存在，若不存在则即时执行预处理并写入磁盘，若存在则直接使用。
   2. 对于成功准备好的场景，立即执行：
      - `python train.py -s <scene_dir> -m output/omniscene_experiments/<scene_name> --eval -r 1 --n_views 6`；由于 `points3d.ply` 已包含绝对尺度点云，默认 **不再加 `--rand_pcd`**，若检测到深度文件缺失可通过 `scripts/run_omniscene.py --force-rand-pcd` 手动退化使用随机点云。
        - `-r 1`：保持 112×200 的低分辨率；若用户切换至 224×400，可在脚本参数中传入。
        - `--n_views 6`：训练集即 6 张输入。
      - `python render.py -m <model_path> --eval -r 1`：使用与训练阶段一致的配置，生成 `metrics_*.txt` 与渲染图像。
-  3. 循环结束后，脚本自动调用 `python metric.py --path output/omniscene_experiments` 汇总指标。
+  3. 普通模式循环结束后，脚本调用 `metric.py` 汇总最终迭代指标。
+- `center150` 使用独立协议：
+  1. 默认优化到 10000 次，在 1000、5000、10000 次迭代分别评估 18 个 target 视角，并记录 PSNR、SSIM、LPIPS 和累计训练耗时。
+  2. 每个评估点保存同名的 `renders/` 与 `gt/` 图像、`metrics_<iteration>.txt`、`training_time_<iteration>.txt`、点云和 checkpoint。
+  3. 训练耗时按纯优化时间累计，不包含评估、点云保存和 checkpoint I/O；累计值写入 checkpoint，断点续跑后继续累加。
+  4. 每个样本完成后写入 `center150_complete.json`。再次运行时会按当前参数核验最终点云、各评估点指标、训练耗时以及 render/GT 文件名集合；完整样本自动跳过，未完成样本从最近 checkpoint 继续。
+  5. 150 个样本全部完成后生成 `center150_metrics_summary.json` 和 `center150_metrics_summary.txt`。JSON 同时保留逐样本结果，以及各评估点的平均指标和平均训练耗时。
 - 由于流程已覆盖预处理与训练，**不再设计拆分阶段或 `--only-prepare` 等选项**；脚本会在内部自动处理“已有缓存则跳过生成、否则即时生成”的逻辑，确保一次命令即可完成完整实验。
 - CLI 选项（全程单阶段）：
   - `--omniscene-root`：原始数据根目录。
-  - `--mode`：`val/train/test/demo`（默认 `val`）。
+  - `--mode`：`val/train/test/demo/center150`（默认 `center150`）。
   - `--resolution`：`112x200` 或 `224x400`（默认 112x200）。
-  - `--iterations`：可选覆盖 `OptimizationParams.iterations`。
+  - `--iterations`：总优化次数，默认 10000。
+  - `--eval-iterations`：`center150` 的评估迭代点，默认 `1000 5000 10000`。
 
 ---
 
 ## 6. 参数与运行策略
 - **分辨率**：默认 112×200，可通过脚本参数提升至 224×400；预处理会在首次运行时根据选择的分辨率输出图像，后续继续沿用同一尺寸。
 - **n_views**：固定为 6，意味着 `Scene.getTrainCameras()` 只包含 6 张输入。
-- **迭代次数**：沿用 `OptimizationParams.iterations=10000`（可通过 CLI 覆盖）。由于数据分辨率低，可增加 `test_iterations` 频率便于监控。
+- **默认协议**：不传参数时直接运行 `center150`，分辨率为 112×200，总优化次数为 10000，并在 1k/5k/10k 三个预算点评估。上述参数均可通过 CLI 显式覆写，续跑完成态和最终汇总会同步使用覆写后的协议。
 - **单阶段运行要求**：所有操作必须在同一脚本执行周期内完成。对于每个场景，流程为“检查缓存 → 若无则预处理并保存 → 训练/优化 → 渲染与指标评估”，不提供拆分运行模式。
 
 ---
 
-## 7. 后续实现要点
-1. **编写 `comp_svfgs/dataset_omniscene.py`**：直接引用 depthsplat 的 `load_conditions`、`load_info` 路径处理逻辑，确保图像/掩码和相机参数一致。
-2. **实现预处理脚本**：读取 loader 输出，生成 Blender 结构与随机点云，结果写入 `output/omniscene_prepared/XX_<token>/`。
-3. **新增运行脚本**：遍历场景并调用现有 `train.py`/`render.py`/`metric.py`，同时在 log 中记录每个阶段的命令行参数。
-4. **文档 & README 补充**：在主 README 的“Training”部分添加 OmniScene 入口说明，或在 docs 中保持更新。
+## 7. Center150 运行命令
 
-通过以上规划，可在不破坏现有 3DGS 训练流程的前提下，将 OmniScene 数据集纳入逐场景优化实验，并与用户自研的 SVF-GS 方法进行统一对比。后续实现阶段将严格依照本文档完成目录创建、代码迁移及脚本接入。
+```bash
+conda run -n DropGaussian python scripts/run_omniscene.py
+```
+
+默认实验目录为 `output/omniscene_center150_112x200/`。命令可安全重复执行：预处理缓存会复用，已经完整的样本会跳过，未完成样本优先从最近 checkpoint 继续；只有 150 个样本都通过完整性校验后才会生成最终汇总。
+
+如需覆写协议，可显式传参，例如：
+
+```bash
+conda run -n DropGaussian python scripts/run_omniscene.py \
+  --resolution 224x400 \
+  --iterations 20000 \
+  --eval-iterations 1000 5000 10000 20000
+```
+
+非默认的总迭代数或评估点会自动写入实验目录名，避免与默认协议的 checkpoint 和指标混用。

@@ -10,6 +10,7 @@
 #
 
 import os
+import time
 import torch
 import torchvision
 from random import randint
@@ -23,6 +24,7 @@ from tqdm import tqdm
 from utils.image_utils import psnr
 from argparse import ArgumentParser, Namespace
 from arguments import ModelParams, PipelineParams, OptimizationParams
+from lpipsPyTorch import LPIPS
 from torchvision.utils import save_image
 from torch import nn
 import copy
@@ -32,14 +34,19 @@ try:
 except ImportError:
     TENSORBOARD_FOUND = False
 
-def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from):
+def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from, full_eval_metrics):
     first_iter = 0
+    accumulated_training_time = 0.0
     tb_writer = prepare_output_and_logger(dataset)
     gaussians = GaussianModel(dataset.sh_degree)
     scene = Scene(dataset, gaussians)
     gaussians.training_setup(opt)
     if checkpoint:
-        (model_params, first_iter) = torch.load(checkpoint)
+        checkpoint_data = torch.load(checkpoint)
+        if len(checkpoint_data) == 3:
+            model_params, first_iter, accumulated_training_time = checkpoint_data
+        else:
+            model_params, first_iter = checkpoint_data
         gaussians.restore(model_params, opt)
 
     bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
@@ -58,6 +65,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     bg_mask = None
     loss_accum = 0
     pseudo_stack = None
+    training_timer_start = time.perf_counter()
+    excluded_training_overhead = 0.0
     for iteration in range(first_iter, opt.iterations + 1):        
         iter_start.record()
 
@@ -101,10 +110,45 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 progress_bar.close()
 
             # Log and save
-            training_report(dataset, tb_writer, iteration, loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, (pipe, background))
+            is_full_evaluation = full_eval_metrics and iteration in testing_iterations
+            training_time_seconds = None
+            evaluation_overhead_start = None
+            if is_full_evaluation:
+                torch.cuda.synchronize()
+                evaluation_overhead_start = time.perf_counter()
+                training_time_seconds = (
+                    accumulated_training_time
+                    + evaluation_overhead_start
+                    - training_timer_start
+                    - excluded_training_overhead
+                )
+            training_report(
+                dataset,
+                tb_writer,
+                iteration,
+                loss,
+                l1_loss,
+                iter_start.elapsed_time(iter_end),
+                testing_iterations,
+                scene,
+                render,
+                (pipe, background),
+                full_eval_metrics,
+                training_time_seconds,
+            )
+            if is_full_evaluation:
+                torch.cuda.synchronize()
+                excluded_training_overhead += time.perf_counter() - evaluation_overhead_start
             if (iteration in saving_iterations):
+                save_overhead_start = None
+                if full_eval_metrics:
+                    torch.cuda.synchronize()
+                    save_overhead_start = time.perf_counter()
                 print("\n[ITER {}] Saving Gaussians".format(iteration))
                 scene.save(iteration)
+                if full_eval_metrics:
+                    torch.cuda.synchronize()
+                    excluded_training_overhead += time.perf_counter() - save_overhead_start
 
             # Densification
             if iteration < opt.densify_until_iter:
@@ -124,8 +168,25 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 gaussians.optimizer.zero_grad(set_to_none = True)
 
             if (iteration in checkpoint_iterations):
+                checkpoint_training_time = None
+                checkpoint_overhead_start = None
+                if full_eval_metrics:
+                    torch.cuda.synchronize()
+                    checkpoint_overhead_start = time.perf_counter()
+                    checkpoint_training_time = (
+                        accumulated_training_time
+                        + checkpoint_overhead_start
+                        - training_timer_start
+                        - excluded_training_overhead
+                    )
                 print("\n[ITER {}] Saving Checkpoint".format(iteration))
-                torch.save((gaussians.capture(), iteration), scene.model_path + "/chkpnt" + str(iteration) + ".pth")
+                checkpoint_payload = (gaussians.capture(), iteration)
+                if full_eval_metrics:
+                    checkpoint_payload += (checkpoint_training_time,)
+                torch.save(checkpoint_payload, scene.model_path + "/chkpnt" + str(iteration) + ".pth")
+                if full_eval_metrics:
+                    torch.cuda.synchronize()
+                    excluded_training_overhead += time.perf_counter() - checkpoint_overhead_start
 
 def prepare_output_and_logger(args):    
     if not args.model_path:
@@ -149,7 +210,23 @@ def prepare_output_and_logger(args):
         print("Tensorboard not available: not logging progress")
     return tb_writer
 
-def training_report(args, tb_writer, iteration, loss, l1_loss, elapsed, testing_iterations, scene : Scene, renderFunc, renderArgs):
+def write_evaluation_metrics(model_path, iteration, psnr_value, ssim_value, lpips_value, training_time_seconds):
+    metrics_path = os.path.join(model_path, 'metrics_{}.txt'.format(iteration))
+    temporary_path = metrics_path + '.tmp'
+    with open(temporary_path, 'w') as metrics_file:
+        metrics_file.write('PSNR : {:>12.7f}\n'.format(psnr_value))
+        metrics_file.write('SSIM : {:>12.7f}\n'.format(ssim_value))
+        metrics_file.write('LPIPS : {:>12.7f}\n'.format(lpips_value))
+    os.replace(temporary_path, metrics_path)
+
+    training_time_path = os.path.join(model_path, 'training_time_{}.txt'.format(iteration))
+    temporary_time_path = training_time_path + '.tmp'
+    with open(temporary_time_path, 'w') as training_time_file:
+        training_time_file.write('TRAINING_TIME_SECONDS : {:.7f}\n'.format(training_time_seconds))
+    os.replace(temporary_time_path, training_time_path)
+
+
+def training_report(args, tb_writer, iteration, loss, l1_loss, elapsed, testing_iterations, scene : Scene, renderFunc, renderArgs, full_eval_metrics=False, training_time_seconds=None):
     if tb_writer:
         # tb_writer.add_scalar('train_loss_patches/l1_loss', Ll1.item(), iteration)
         tb_writer.add_scalar('train_loss_patches/total_loss', loss.item(), iteration)
@@ -157,6 +234,8 @@ def training_report(args, tb_writer, iteration, loss, l1_loss, elapsed, testing_
 
     # Report test and samples of training set
     if iteration in testing_iterations:
+        cpu_rng_state = torch.get_rng_state() if full_eval_metrics else None
+        cuda_rng_state = torch.cuda.get_rng_state() if full_eval_metrics else None
         torch.cuda.empty_cache()
         validation_configs = ({'name': 'test', 'cameras' : scene.getTestCameras()}, 
                               {'name': 'train', 'cameras' : [scene.getTrainCameras()[idx % len(scene.getTrainCameras())] for idx in range(len(scene.getTrainCameras()))]})
@@ -169,6 +248,10 @@ def training_report(args, tb_writer, iteration, loss, l1_loss, elapsed, testing_
             if config['cameras'] and len(config['cameras']) > 0:
                 l1_test = 0.0
                 psnr_test = 0.0
+                is_full_test_eval = full_eval_metrics and config['name'] == 'test'
+                ssim_test = 0.0
+                lpips_test = 0.0
+                lpips_metric = LPIPS(net_type='vgg').to('cuda').eval() if is_full_test_eval else None
                 for idx, viewpoint in enumerate(config['cameras']):
                     render_pkg = renderFunc(viewpoint, scene.gaussians, *renderArgs)
                     image = render_pkg["render"]
@@ -178,19 +261,49 @@ def training_report(args, tb_writer, iteration, loss, l1_loss, elapsed, testing_
                         if iteration == testing_iterations[0]:
                             tb_writer.add_images(config['name'] + "_view_{}/ground_truth".format(viewpoint.image_name), gt_image[None], global_step=iteration)
                     l1_test += l1_loss(image, gt_image).mean().double()
-                    psnr_test += psnr(image, gt_image).mean().double()
+                    if is_full_test_eval:
+                        psnr_test += psnr(image.unsqueeze(0), gt_image.unsqueeze(0)).mean().double()
+                        ssim_test += ssim(image.unsqueeze(0), gt_image.unsqueeze(0)).mean().double()
+                        lpips_test += lpips_metric(image.unsqueeze(0), gt_image.unsqueeze(0)).mean().double()
+                    else:
+                        psnr_test += psnr(image, gt_image).mean().double()
                     torchvision.utils.save_image(image, os.path.join(render_path, viewpoint.image_name + ".png"))
                     torchvision.utils.save_image(gt_image, os.path.join(gts_path, viewpoint.image_name + ".png"))
                 psnr_test /= len(config['cameras'])
                 l1_test /= len(config['cameras'])
-                print("\n[ITER {}] Evaluating {}: L1 {} PSNR {}".format(iteration, config['name'], l1_test, psnr_test))
+                if is_full_test_eval:
+                    ssim_test /= len(config['cameras'])
+                    lpips_test /= len(config['cameras'])
+                    write_evaluation_metrics(
+                        args.model_path,
+                        iteration,
+                        psnr_test.item(),
+                        ssim_test.item(),
+                        lpips_test.item(),
+                        training_time_seconds,
+                    )
+                    print(
+                        "\n[ITER {}] Evaluating {}: L1 {} PSNR {} SSIM {} LPIPS {} TRAIN_TIME {}s".format(
+                            iteration, config['name'], l1_test, psnr_test, ssim_test, lpips_test, training_time_seconds
+                        )
+                    )
+                    del lpips_metric
+                else:
+                    print("\n[ITER {}] Evaluating {}: L1 {} PSNR {}".format(iteration, config['name'], l1_test, psnr_test))
                 if tb_writer:
                     tb_writer.add_scalar(config['name'] + '/loss_viewpoint - l1_loss', l1_test, iteration)
                     tb_writer.add_scalar(config['name'] + '/loss_viewpoint - psnr', psnr_test, iteration)
+                    if is_full_test_eval:
+                        tb_writer.add_scalar(config['name'] + '/ssim', ssim_test, iteration)
+                        tb_writer.add_scalar(config['name'] + '/lpips', lpips_test, iteration)
+                        tb_writer.add_scalar(config['name'] + '/training_time_seconds', training_time_seconds, iteration)
 
         if tb_writer:
             tb_writer.add_histogram("scene/opacity_histogram", scene.gaussians.get_opacity, iteration)
             tb_writer.add_scalar('total_points', scene.gaussians.get_xyz.shape[0], iteration)
+        if full_eval_metrics:
+            torch.set_rng_state(cpu_rng_state)
+            torch.cuda.set_rng_state(cuda_rng_state)
         torch.cuda.empty_cache()
 
 if __name__ == "__main__":
@@ -208,6 +321,7 @@ if __name__ == "__main__":
     parser.add_argument("--quiet", action="store_true")
     parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[])
     parser.add_argument("--start_checkpoint", type=str, default = None)
+    parser.add_argument("--full_eval_metrics", action="store_true")
     args = parser.parse_args(sys.argv[1:])
     args.save_iterations.append(args.iterations)
     
@@ -219,7 +333,7 @@ if __name__ == "__main__":
     # Start GUI server, configure and run training
     network_gui.init(args.ip, args.port)
     torch.autograd.set_detect_anomaly(args.detect_anomaly)
-    training(lp.extract(args), op.extract(args), pp.extract(args), args.test_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, args.debug_from)
+    training(lp.extract(args), op.extract(args), pp.extract(args), args.test_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, args.debug_from, args.full_eval_metrics)
 
     # All done
     print("\nTraining complete.")

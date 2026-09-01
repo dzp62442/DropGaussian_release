@@ -12,9 +12,11 @@ from PIL import Image
 from plyfile import PlyData, PlyElement
 
 
-StageLiteral = Literal["train", "val", "test", "demo"]
+StageLiteral = Literal["train", "val", "test", "demo", "center150"]
 DEPTH_CONFIDENCE_THRESHOLD = 0.3
 OMNISCENE_PREPARED_FORMAT_VERSION = 2
+CENTER150_FILENAME = "bins_center150_v1.json"
+CENTER150_SAMPLE_COUNT = 150
 
 
 def _ensure_image_tensor(img: torch.Tensor) -> torch.Tensor:
@@ -289,7 +291,20 @@ class OmniSceneDataset:
             path = self._json_path("bins_val_3.2m.json")
             tokens = json.load(open(path))["bins"]
             tokens = tokens[0::14][:2048]
-        else:
+        elif self.mode == "center150":
+            path = self._json_path(CENTER150_FILENAME)
+            if not path.is_file():
+                raise FileNotFoundError(
+                    f"Center150 split file not found: {path}. "
+                    "Generate it from the SVF-GS project first."
+                )
+            tokens = json.load(open(path))["bins"]
+            if len(tokens) != CENTER150_SAMPLE_COUNT or len(set(tokens)) != CENTER150_SAMPLE_COUNT:
+                raise ValueError(
+                    f"Center150 split must contain {CENTER150_SAMPLE_COUNT} unique bins, "
+                    f"got {len(tokens)} entries and {len(set(tokens))} unique entries."
+                )
+        elif self.mode == "demo":
             tokens = [
                 "scenee7ef871f77f44331aefdebc24ec034b7_bin010",
                 "scenee7ef871f77f44331aefdebc24ec034b7_bin200",
@@ -304,6 +319,8 @@ class OmniSceneDataset:
                 "scene7e2d9f38f8eb409ea57b3864bb4ed098_bin150",
                 "scene50ff554b3ecb4d208849d042b7643715_bin000",
             ]
+        else:
+            raise ValueError(f"Unsupported OmniScene mode: {self.mode}")
         return tokens
 
     def __len__(self) -> int:
