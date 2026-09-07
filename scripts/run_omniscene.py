@@ -6,6 +6,10 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
+import numpy as np
+import torch
+from PIL import Image
+
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
@@ -24,9 +28,13 @@ OUTPUT_ROOT = REPO_ROOT / "output"
 PREPARED_ROOT = OUTPUT_ROOT / "omniscene_prepared"
 DEFAULT_EVAL_ITERATIONS = (1000, 5000, 10000)
 DEFAULT_TOTAL_ITERATIONS = 10000
-CENTER150_STATE_VERSION = 3
+CENTER150_STATE_VERSION = 4
 METRIC_NAMES = ("PSNR", "SSIM", "LPIPS")
 TRAINING_TIME_KEY = "training_time_seconds"
+ALL_VIEWS_SCOPE = "all_18_views"
+NOVEL_VIEWS_SCOPE = "novel_12_views"
+ALL_VIEW_COUNT = 18
+NOVEL_VIEW_COUNT = 12
 
 
 def parse_resolution(value: str) -> tuple[int, int]:
@@ -80,6 +88,13 @@ def parse_metrics(metrics_path: Path) -> dict[str, float]:
     return values
 
 
+def write_metrics(metrics_path: Path, metrics: dict[str, float]) -> None:
+    atomic_write_text(
+        metrics_path,
+        "".join(f"{name} : {metrics[name]:>12.7f}\n" for name in METRIC_NAMES),
+    )
+
+
 def parse_training_time(training_time_path: Path) -> float:
     line = training_time_path.read_text(encoding="utf-8").strip()
     name, separator, value = line.partition(":")
@@ -91,20 +106,103 @@ def parse_training_time(training_time_path: Path) -> float:
     return training_time_seconds
 
 
-def expected_test_image_names(scene_dir: Path) -> set[str]:
+def expected_test_image_names(scene_dir: Path) -> tuple[str, ...]:
     transforms_path = scene_dir / "transforms_test.json"
     transforms = json.loads(transforms_path.read_text(encoding="utf-8"))
     names = [Path(frame["file_path"]).stem + ".png" for frame in transforms["frames"]]
     if len(names) != len(set(names)):
         raise ValueError(f"Duplicate test image names in {transforms_path}")
-    return set(names)
+    if len(names) != ALL_VIEW_COUNT:
+        raise ValueError(
+            f"Center150 expects {ALL_VIEW_COUNT} test images, got {len(names)} in {transforms_path}"
+        )
+    return tuple(names)
 
 
-def iteration_complete(model_path: Path, scene_dir: Path, iteration: int) -> bool:
+class SavedImageMetricEvaluator:
+    def __init__(self, device: str = "auto") -> None:
+        if device == "auto":
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+        self.device = torch.device(device)
+        self.lpips_metric = None
+
+    def _lpips(self):
+        if self.lpips_metric is None:
+            from lpipsPyTorch import LPIPS
+
+            print(f"[Metrics] Loading LPIPS on {self.device}", flush=True)
+            self.lpips_metric = LPIPS(net_type="vgg").to(self.device).eval()
+        return self.lpips_metric
+
+    @staticmethod
+    def _load_images(paths: list[Path]) -> torch.Tensor:
+        images = []
+        for path in paths:
+            with Image.open(path) as image:
+                image_array = np.asarray(image.convert("RGB"), dtype=np.float32).copy()
+                images.append(torch.from_numpy(image_array).permute(2, 0, 1).div_(255.0))
+        return torch.stack(images)
+
+    def evaluate(
+        self,
+        render_paths: list[Path],
+        gt_paths: list[Path],
+    ) -> dict[str, float]:
+        from utils.image_utils import psnr
+        from utils.loss_utils import ssim
+
+        renders = self._load_images(render_paths).to(self.device)
+        ground_truth = self._load_images(gt_paths).to(self.device)
+        with torch.inference_mode():
+            lpips_sum = self._lpips()(renders, ground_truth).sum()
+            values = {
+                "PSNR": psnr(renders, ground_truth).mean().item(),
+                "SSIM": ssim(renders, ground_truth, size_average=False).mean().item(),
+                "LPIPS": (lpips_sum / len(renders)).item(),
+            }
+        if not all(math.isfinite(value) for value in values.values()):
+            raise ValueError(f"Non-finite saved-image metrics: {values}")
+        return values
+
+
+def novel_metrics_path(model_path: Path, iteration: int) -> Path:
+    return model_path / f"metrics_novel_12_{iteration}.txt"
+
+
+def ensure_novel_view_metrics(
+    model_path: Path,
+    scene_dir: Path,
+    iteration: int,
+    evaluator: SavedImageMetricEvaluator,
+) -> dict[str, float]:
+    output_path = novel_metrics_path(model_path, iteration)
+    try:
+        return parse_metrics(output_path)
+    except (OSError, ValueError):
+        pass
+
+    image_names = expected_test_image_names(scene_dir)[:NOVEL_VIEW_COUNT]
+    iteration_dir = model_path / "test" / f"ours_{iteration}"
+    render_paths = [iteration_dir / "renders" / name for name in image_names]
+    gt_paths = [iteration_dir / "gt" / name for name in image_names]
+    missing = [path for path in render_paths + gt_paths if not path.is_file()]
+    if missing:
+        raise FileNotFoundError(f"Missing saved image for novel-view metrics: {missing[0]}")
+
+    metrics = evaluator.evaluate(render_paths, gt_paths)
+    write_metrics(output_path, metrics)
+    print(
+        f"[Metrics] Added {NOVEL_VIEW_COUNT}-view metrics: "
+        f"{model_path.name} at iteration {iteration}"
+    )
+    return metrics
+
+
+def iteration_artifacts_complete(model_path: Path, scene_dir: Path, iteration: int) -> bool:
     try:
         parse_metrics(model_path / f"metrics_{iteration}.txt")
         parse_training_time(model_path / f"training_time_{iteration}.txt")
-        expected_names = expected_test_image_names(scene_dir)
+        expected_names = set(expected_test_image_names(scene_dir))
     except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError):
         return False
 
@@ -120,6 +218,16 @@ def iteration_complete(model_path: Path, scene_dir: Path, iteration: int) -> boo
     )
 
 
+def iteration_complete(model_path: Path, scene_dir: Path, iteration: int) -> bool:
+    if not iteration_artifacts_complete(model_path, scene_dir, iteration):
+        return False
+    try:
+        parse_metrics(novel_metrics_path(model_path, iteration))
+    except (OSError, ValueError):
+        return False
+    return True
+
+
 def scene_complete(
     model_path: Path,
     scene_dir: Path,
@@ -131,6 +239,27 @@ def scene_complete(
         return False
     if not all(
         iteration_complete(model_path, scene_dir, iteration)
+        for iteration in evaluation_iterations
+    ):
+        return False
+    training_times = [
+        parse_training_time(model_path / f"training_time_{iteration}.txt")
+        for iteration in evaluation_iterations
+    ]
+    return training_times == sorted(training_times)
+
+
+def scene_training_complete(
+    model_path: Path,
+    scene_dir: Path,
+    total_iterations: int,
+    evaluation_iterations: tuple[int, ...],
+) -> bool:
+    final_ply = model_path / "point_cloud" / f"iteration_{total_iterations}" / "point_cloud.ply"
+    if not final_ply.is_file() or final_ply.stat().st_size == 0:
+        return False
+    if not all(
+        iteration_artifacts_complete(model_path, scene_dir, iteration)
         for iteration in evaluation_iterations
     ):
         return False
@@ -160,8 +289,20 @@ def normalized_metrics(metrics: dict[str, float]) -> dict[str, float]:
     return {name.lower(): metrics[name] for name in METRIC_NAMES}
 
 
-def evaluation_record(model_path: Path, iteration: int) -> dict[str, float]:
-    record = normalized_metrics(parse_metrics(model_path / f"metrics_{iteration}.txt"))
+def evaluation_record(model_path: Path, iteration: int) -> dict:
+    all_view_metrics = normalized_metrics(parse_metrics(model_path / f"metrics_{iteration}.txt"))
+    novel_view_metrics = normalized_metrics(parse_metrics(novel_metrics_path(model_path, iteration)))
+    record = {
+        **all_view_metrics,
+        ALL_VIEWS_SCOPE: {
+            "num_views": ALL_VIEW_COUNT,
+            **all_view_metrics,
+        },
+        NOVEL_VIEWS_SCOPE: {
+            "num_views": NOVEL_VIEW_COUNT,
+            **novel_view_metrics,
+        },
+    }
     record[TRAINING_TIME_KEY] = parse_training_time(model_path / f"training_time_{iteration}.txt")
     return record
 
@@ -242,8 +383,11 @@ def run_center150_scene(
     total_iterations: int,
     evaluation_iterations: tuple[int, ...],
     force_rand_pcd: bool,
+    metric_evaluator: SavedImageMetricEvaluator,
 ) -> None:
-    if scene_complete(model_path, scene_dir, total_iterations, evaluation_iterations):
+    if scene_training_complete(model_path, scene_dir, total_iterations, evaluation_iterations):
+        for iteration in evaluation_iterations:
+            ensure_novel_view_metrics(model_path, scene_dir, iteration, metric_evaluator)
         write_scene_completion(
             model_path,
             scene_name,
@@ -252,7 +396,7 @@ def run_center150_scene(
             total_iterations,
             evaluation_iterations,
         )
-        print(f"[Skip] Completed center150 scene: {scene_name}")
+        print(f"[Skip] Completed center150 training: {scene_name}")
         return
 
     latest_checkpoint = find_latest_checkpoint(model_path, total_iterations)
@@ -277,7 +421,7 @@ def run_center150_scene(
         print(f"[Resume] Training already reached iteration {latest_checkpoint[0]}: {scene_name}")
 
     for iteration in evaluation_iterations:
-        if iteration_complete(model_path, scene_dir, iteration):
+        if iteration_artifacts_complete(model_path, scene_dir, iteration):
             continue
         try:
             parse_training_time(model_path / f"training_time_{iteration}.txt")
@@ -304,6 +448,9 @@ def run_center150_scene(
                 "--skip_train",
             ]
         )
+
+    for iteration in evaluation_iterations:
+        ensure_novel_view_metrics(model_path, scene_dir, iteration, metric_evaluator)
 
     if not scene_complete(model_path, scene_dir, total_iterations, evaluation_iterations):
         raise RuntimeError(f"Center150 scene did not produce a complete result: {scene_name}")
@@ -360,23 +507,25 @@ def aggregate_center150_results(
 
     samples = []
     accumulators = {
-        iteration: {name: [] for name in (*METRIC_NAMES, TRAINING_TIME_KEY)}
+        iteration: {
+            scope: {name: [] for name in METRIC_NAMES}
+            for scope in (ALL_VIEWS_SCOPE, NOVEL_VIEWS_SCOPE)
+        }
         for iteration in evaluation_iterations
     }
+    training_time_accumulators = {iteration: [] for iteration in evaluation_iterations}
     for scene_name, bin_token, scene_dir, model_path in scene_records:
         if not scene_complete(model_path, scene_dir, total_iterations, evaluation_iterations):
             raise RuntimeError(f"Cannot aggregate incomplete center150 scene: {scene_name}")
         sample_metrics = {}
         for iteration in evaluation_iterations:
-            metrics = parse_metrics(model_path / f"metrics_{iteration}.txt")
+            metrics = evaluation_record(model_path, iteration)
             training_time_seconds = parse_training_time(model_path / f"training_time_{iteration}.txt")
-            sample_metrics[str(iteration)] = {
-                **normalized_metrics(metrics),
-                TRAINING_TIME_KEY: training_time_seconds,
-            }
-            for name in METRIC_NAMES:
-                accumulators[iteration][name].append(metrics[name])
-            accumulators[iteration][TRAINING_TIME_KEY].append(training_time_seconds)
+            sample_metrics[str(iteration)] = metrics
+            for scope in (ALL_VIEWS_SCOPE, NOVEL_VIEWS_SCOPE):
+                for name in METRIC_NAMES:
+                    accumulators[iteration][scope][name].append(metrics[scope][name.lower()])
+            training_time_accumulators[iteration].append(training_time_seconds)
         samples.append(
             {
                 "scene_name": scene_name,
@@ -387,14 +536,26 @@ def aggregate_center150_results(
 
     averages = {}
     for iteration in evaluation_iterations:
+        scope_averages = {}
+        for scope, view_count in (
+            (ALL_VIEWS_SCOPE, ALL_VIEW_COUNT),
+            (NOVEL_VIEWS_SCOPE, NOVEL_VIEW_COUNT),
+        ):
+            scope_averages[scope] = {
+                "num_samples": CENTER150_SAMPLE_COUNT,
+                "num_views_per_sample": view_count,
+                **{
+                    name.lower(): sum(accumulators[iteration][scope][name]) / CENTER150_SAMPLE_COUNT
+                    for name in METRIC_NAMES
+                },
+            }
+        all_view_average = scope_averages[ALL_VIEWS_SCOPE]
         averages[str(iteration)] = {
             "num_samples": CENTER150_SAMPLE_COUNT,
-            **{
-                name.lower(): sum(accumulators[iteration][name]) / CENTER150_SAMPLE_COUNT
-                for name in METRIC_NAMES
-            },
+            **{name.lower(): all_view_average[name.lower()] for name in METRIC_NAMES},
+            **scope_averages,
             TRAINING_TIME_KEY: (
-                sum(accumulators[iteration][TRAINING_TIME_KEY]) / CENTER150_SAMPLE_COUNT
+                sum(training_time_accumulators[iteration]) / CENTER150_SAMPLE_COUNT
             ),
         }
 
@@ -414,12 +575,16 @@ def aggregate_center150_results(
     lines = [f"Center150 samples: {CENTER150_SAMPLE_COUNT}"]
     for iteration in evaluation_iterations:
         result = averages[str(iteration)]
+        novel_result = result[NOVEL_VIEWS_SCOPE]
         lines.extend(
             [
                 f"Iteration {iteration}",
                 f"PSNR : {result['psnr']:.7f}",
                 f"SSIM : {result['ssim']:.7f}",
                 f"LPIPS : {result['lpips']:.7f}",
+                f"NOVEL_12_PSNR : {novel_result['psnr']:.7f}",
+                f"NOVEL_12_SSIM : {novel_result['ssim']:.7f}",
+                f"NOVEL_12_LPIPS : {novel_result['lpips']:.7f}",
                 f"TRAINING_TIME_SECONDS : {result[TRAINING_TIME_KEY]:.7f}",
             ]
         )
@@ -428,9 +593,12 @@ def aggregate_center150_results(
     print(f"[Summary] {CENTER150_SAMPLE_COUNT} center150 scenes")
     for iteration in evaluation_iterations:
         result = averages[str(iteration)]
+        novel_result = result[NOVEL_VIEWS_SCOPE]
         print(
-            f"  {iteration}: PSNR={result['psnr']:.7f}, "
+            f"  {iteration} all-18: PSNR={result['psnr']:.7f}, "
             f"SSIM={result['ssim']:.7f}, LPIPS={result['lpips']:.7f}, "
+            f"novel-12: PSNR={novel_result['psnr']:.7f}, "
+            f"SSIM={novel_result['ssim']:.7f}, LPIPS={novel_result['lpips']:.7f}, "
             f"TRAIN_TIME={result[TRAINING_TIME_KEY]:.7f}s"
         )
     return summary
@@ -453,6 +621,12 @@ def main() -> None:
         help="Evaluation iterations used by the center150 protocol",
     )
     parser.add_argument("--experiment-name", type=str, default="omniscene", help="Experiment folder under output/")
+    parser.add_argument(
+        "--metrics-device",
+        choices=["auto", "cpu", "cuda"],
+        default="cpu",
+        help="Device used to backfill novel-view metrics from saved images",
+    )
     parser.add_argument(
         "--force-rand-pcd",
         action="store_true",
@@ -491,6 +665,7 @@ def main() -> None:
     python_bin = sys.executable
     scene_index_width = 3 if args.mode == "center150" else 2
     scene_records = []
+    metric_evaluator = SavedImageMetricEvaluator(args.metrics_device)
 
     for idx, token in enumerate(dataset.bin_tokens):
         scene_name = f"{idx + 1:0{scene_index_width}d}_{token}"
@@ -510,6 +685,7 @@ def main() -> None:
                 args.iterations,
                 evaluation_iterations,
                 args.force_rand_pcd,
+                metric_evaluator,
             )
         else:
             run_standard_scene(

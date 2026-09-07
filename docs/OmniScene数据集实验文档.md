@@ -81,11 +81,12 @@
      - `python render.py -m <model_path> --eval -r 1`：使用与训练阶段一致的配置，生成 `metrics_*.txt` 与渲染图像。
   3. 普通模式循环结束后，脚本调用 `metric.py` 汇总最终迭代指标。
 - `center150` 使用独立协议：
-  1. 默认优化到 10000 次，在 1000、5000、10000 次迭代分别评估 18 个 target 视角，并记录 PSNR、SSIM、LPIPS 和累计训练耗时。
-  2. 每个评估点保存同名的 `renders/` 与 `gt/` 图像、`metrics_<iteration>.txt`、`training_time_<iteration>.txt`、点云和 checkpoint。
-  3. 训练耗时按纯优化时间累计，不包含评估、点云保存和 checkpoint I/O；累计值写入 checkpoint，断点续跑后继续累加。
-  4. 每个样本完成后写入 `center150_complete.json`。再次运行时会按当前参数核验最终点云、各评估点指标、训练耗时以及 render/GT 文件名集合；完整样本自动跳过，未完成样本从最近 checkpoint 继续。
-  5. 150 个样本全部完成后生成 `center150_metrics_summary.json` 和 `center150_metrics_summary.txt`。JSON 同时保留逐样本结果，以及各评估点的平均指标和平均训练耗时。
+  1. 默认优化到 10000 次，在 1000、5000、10000 次迭代分别评估 18 个 target 视角，并同时报告全部 18 路（12 路相邻时刻新视角 + 6 路输入视角）和前 12 路新视角的 PSNR、SSIM、LPIPS 均值，以及累计训练耗时。
+  2. 每个评估点保存同名的 `renders/` 与 `gt/` 图像；原有 `metrics_<iteration>.txt` 继续记录 18 路均值，新增 `metrics_novel_12_<iteration>.txt` 记录按 `transforms_test.json` 顺序选取的前 12 路新视角均值，同时保存 `training_time_<iteration>.txt`、点云和 checkpoint。
+  3. 对于新训练，评估循环还会写入 `metrics_per_view_<iteration>.json`，逐项记录 18 个视角的顺序、图像名、`novel/context` 身份及 PSNR、SSIM、LPIPS。后续如需按其他视角范围统计，可以直接从该文件重新聚合，无需重新训练或渲染。
+  4. 训练耗时按纯优化时间累计，不包含评估、点云保存和 checkpoint I/O；累计值写入 checkpoint，断点续跑后继续累加。
+  5. 每个样本完成后写入 `center150_complete.json`。再次运行时会按当前参数核验最终点云、各评估点指标、训练耗时以及 render/GT 文件名集合；训练已完成但缺少 12 路指标的旧实验不会重新训练或渲染，只从既有图像补算新视角指标，且不会改写 `training_time_<iteration>.txt`。
+  6. 150 个样本全部完成后生成 `center150_metrics_summary.json` 和 `center150_metrics_summary.txt`。逐样本完成文件和最终汇总均同时包含 `all_18_views` 与 `novel_12_views`；为兼容已有分析代码，原有扁平 PSNR、SSIM、LPIPS 字段仍表示 18 路均值。
 - 由于流程已覆盖预处理与训练，**不再设计拆分阶段或 `--only-prepare` 等选项**；脚本会在内部自动处理“已有缓存则跳过生成、否则即时生成”的逻辑，确保一次命令即可完成完整实验。
 - CLI 选项（全程单阶段）：
   - `--omniscene-root`：原始数据根目录。
@@ -93,6 +94,7 @@
   - `--resolution`：`112x200` 或 `224x400`（默认 112x200）。
   - `--iterations`：总优化次数，默认 10000。
   - `--eval-iterations`：`center150` 的评估迭代点，默认 `1000 5000 10000`。
+  - `--metrics-device`：从既有 PNG 补算前 12 路指标的设备，默认 `cpu`，可显式覆写为 `cuda` 或 `auto`；该统计阶段不计入训练耗时。
 
 ---
 

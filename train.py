@@ -10,6 +10,7 @@
 #
 
 import os
+import json
 import time
 import torch
 import torchvision
@@ -210,14 +211,73 @@ def prepare_output_and_logger(args):
         print("Tensorboard not available: not logging progress")
     return tb_writer
 
-def write_evaluation_metrics(model_path, iteration, psnr_value, ssim_value, lpips_value, training_time_seconds):
-    metrics_path = os.path.join(model_path, 'metrics_{}.txt'.format(iteration))
-    temporary_path = metrics_path + '.tmp'
+def atomic_write_json(path, payload):
+    temporary_path = path + '.tmp'
+    with open(temporary_path, 'w') as output_file:
+        json.dump(payload, output_file, indent=2)
+        output_file.write('\n')
+    os.replace(temporary_path, path)
+
+
+def write_metric_means(path, metrics):
+    temporary_path = path + '.tmp'
     with open(temporary_path, 'w') as metrics_file:
-        metrics_file.write('PSNR : {:>12.7f}\n'.format(psnr_value))
-        metrics_file.write('SSIM : {:>12.7f}\n'.format(ssim_value))
-        metrics_file.write('LPIPS : {:>12.7f}\n'.format(lpips_value))
-    os.replace(temporary_path, metrics_path)
+        metrics_file.write('PSNR : {:>12.7f}\n'.format(metrics['psnr']))
+        metrics_file.write('SSIM : {:>12.7f}\n'.format(metrics['ssim']))
+        metrics_file.write('LPIPS : {:>12.7f}\n'.format(metrics['lpips']))
+    os.replace(temporary_path, path)
+
+
+def mean_view_metrics(per_view_metrics):
+    return {
+        name: sum(view[name] for view in per_view_metrics) / len(per_view_metrics)
+        for name in ('psnr', 'ssim', 'lpips')
+    }
+
+
+def target_view_indices(source_path):
+    transforms_path = os.path.join(source_path, 'transforms_test.json')
+    with open(transforms_path, 'r') as transforms_file:
+        frames = json.load(transforms_file)['frames']
+    image_names = [os.path.basename(frame['file_path']) for frame in frames]
+    if len(image_names) != 18 or len(set(image_names)) != 18:
+        raise ValueError('Center150 full evaluation expects 18 unique test image names in {}'.format(transforms_path))
+    return {image_name: index for index, image_name in enumerate(image_names)}
+
+
+def write_evaluation_metrics(model_path, iteration, per_view_metrics, training_time_seconds):
+    if len(per_view_metrics) != 18:
+        raise ValueError('Center150 full evaluation expects 18 test views, got {}'.format(len(per_view_metrics)))
+    per_view_metrics = sorted(per_view_metrics, key=lambda view: view['index'])
+    if [view['index'] for view in per_view_metrics] != list(range(18)):
+        raise ValueError('Center150 per-view metrics must cover target indices 0 through 17 exactly once')
+    novel_views = [view for view in per_view_metrics if view['view_role'] == 'novel']
+    context_views = [view for view in per_view_metrics if view['view_role'] == 'context']
+    if len(novel_views) != 12 or len(context_views) != 6:
+        raise ValueError('Center150 per-view metrics must contain 12 novel and 6 context views')
+    all_view_metrics = mean_view_metrics(per_view_metrics)
+    novel_view_metrics = mean_view_metrics(novel_views)
+
+    metrics_path = os.path.join(model_path, 'metrics_{}.txt'.format(iteration))
+    write_metric_means(metrics_path, all_view_metrics)
+    novel_metrics_path = os.path.join(model_path, 'metrics_novel_12_{}.txt'.format(iteration))
+    write_metric_means(novel_metrics_path, novel_view_metrics)
+    atomic_write_json(
+        os.path.join(model_path, 'metrics_per_view_{}.json'.format(iteration)),
+        {
+            'iteration': iteration,
+            'num_views': len(per_view_metrics),
+            'views': per_view_metrics,
+            'all_18_views': {
+                'num_views': len(per_view_metrics),
+                **all_view_metrics,
+            },
+            'novel_12_views': {
+                'num_views': 12,
+                **novel_view_metrics,
+            },
+        },
+    )
 
     training_time_path = os.path.join(model_path, 'training_time_{}.txt'.format(iteration))
     temporary_time_path = training_time_path + '.tmp'
@@ -251,6 +311,8 @@ def training_report(args, tb_writer, iteration, loss, l1_loss, elapsed, testing_
                 is_full_test_eval = full_eval_metrics and config['name'] == 'test'
                 ssim_test = 0.0
                 lpips_test = 0.0
+                per_view_metrics = []
+                test_view_indices = target_view_indices(args.source_path) if is_full_test_eval else None
                 lpips_metric = LPIPS(net_type='vgg').to('cuda').eval() if is_full_test_eval else None
                 for idx, viewpoint in enumerate(config['cameras']):
                     render_pkg = renderFunc(viewpoint, scene.gaussians, *renderArgs)
@@ -262,9 +324,23 @@ def training_report(args, tb_writer, iteration, loss, l1_loss, elapsed, testing_
                             tb_writer.add_images(config['name'] + "_view_{}/ground_truth".format(viewpoint.image_name), gt_image[None], global_step=iteration)
                     l1_test += l1_loss(image, gt_image).mean().double()
                     if is_full_test_eval:
-                        psnr_test += psnr(image.unsqueeze(0), gt_image.unsqueeze(0)).mean().double()
-                        ssim_test += ssim(image.unsqueeze(0), gt_image.unsqueeze(0)).mean().double()
-                        lpips_test += lpips_metric(image.unsqueeze(0), gt_image.unsqueeze(0)).mean().double()
+                        view_psnr = psnr(image.unsqueeze(0), gt_image.unsqueeze(0)).mean().double()
+                        view_ssim = ssim(image.unsqueeze(0), gt_image.unsqueeze(0)).mean().double()
+                        view_lpips = lpips_metric(image.unsqueeze(0), gt_image.unsqueeze(0)).mean().double()
+                        psnr_test += view_psnr
+                        ssim_test += view_ssim
+                        lpips_test += view_lpips
+                        target_index = test_view_indices[viewpoint.image_name]
+                        per_view_metrics.append(
+                            {
+                                'index': target_index,
+                                'image_name': viewpoint.image_name + '.png',
+                                'view_role': 'novel' if target_index < 12 else 'context',
+                                'psnr': view_psnr.item(),
+                                'ssim': view_ssim.item(),
+                                'lpips': view_lpips.item(),
+                            }
+                        )
                     else:
                         psnr_test += psnr(image, gt_image).mean().double()
                     torchvision.utils.save_image(image, os.path.join(render_path, viewpoint.image_name + ".png"))
@@ -277,9 +353,7 @@ def training_report(args, tb_writer, iteration, loss, l1_loss, elapsed, testing_
                     write_evaluation_metrics(
                         args.model_path,
                         iteration,
-                        psnr_test.item(),
-                        ssim_test.item(),
-                        lpips_test.item(),
+                        per_view_metrics,
                         training_time_seconds,
                     )
                     print(
