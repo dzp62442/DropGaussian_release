@@ -150,10 +150,47 @@ class OmniSceneMetricScopeTest(unittest.TestCase):
             ) = self._make_completed_scene(root)
             final_ply = model_path / "point_cloud" / "iteration_1000" / "point_cloud.ply"
             final_ply.unlink()
+            stale_checkpoint = model_path / "chkpnt500.pth"
+            stale_checkpoint.write_bytes(b"checkpoint")
+            stale_point_cloud = (
+                model_path / "point_cloud" / "iteration_500" / "point_cloud.ply"
+            )
+            stale_point_cloud.parent.mkdir(parents=True)
+            stale_point_cloud.write_bytes(b"ply")
             evaluator = FakeMetricEvaluator()
 
             def finish_training(command):
                 self.assertIn("train.py", command)
+                self.assertNotIn("--checkpoint_iterations", command)
+                self.assertNotIn("--start_checkpoint", command)
+                save_index = command.index("--save_iterations")
+                self.assertEqual(command[save_index + 1 : save_index + 2], ["1000"])
+                self.assertFalse(stale_checkpoint.exists())
+                self.assertFalse(stale_point_cloud.exists())
+
+                model_path.mkdir(parents=True)
+                run_omniscene.write_metrics(
+                    model_path / "metrics_1000.txt",
+                    {"PSNR": 20.0, "SSIM": 0.8, "LPIPS": 0.2},
+                )
+                run_omniscene.write_metrics(
+                    run_omniscene.novel_metrics_path(model_path, 1000),
+                    {"PSNR": 21.0, "SSIM": 0.81, "LPIPS": 0.19},
+                )
+                (model_path / "training_time_1000.txt").write_text(
+                    "TRAINING_TIME_SECONDS : 2.5000000\n"
+                )
+                transforms = json.loads((scene_dir / "transforms_test.json").read_text())
+                image_names = [
+                    Path(frame["file_path"]).name + ".png"
+                    for frame in transforms["frames"]
+                ]
+                for folder in ("renders", "gt"):
+                    image_dir = model_path / "test" / "ours_1000" / folder
+                    image_dir.mkdir(parents=True)
+                    for name in image_names:
+                        (image_dir / name).write_bytes(b"png")
+                final_ply.parent.mkdir(parents=True)
                 final_ply.write_bytes(b"ply")
 
             with mock.patch.object(
@@ -173,7 +210,7 @@ class OmniSceneMetricScopeTest(unittest.TestCase):
                 )
 
             run_command.assert_called_once()
-            self.assertEqual(len(evaluator.calls), 1)
+            self.assertEqual(len(evaluator.calls), 0)
             self.assertTrue(
                 run_omniscene.scene_complete(model_path, scene_dir, 1000, (1000,))
             )

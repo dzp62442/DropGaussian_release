@@ -1,6 +1,7 @@
 import argparse
 import json
 import math
+import shutil
 import subprocess
 import sys
 from datetime import datetime, timezone
@@ -335,17 +336,6 @@ def write_scene_completion(
     )
 
 
-def find_latest_checkpoint(model_path: Path, total_iterations: int) -> tuple[int, Path] | None:
-    candidates = []
-    for checkpoint_path in model_path.glob("chkpnt*.pth"):
-        suffix = checkpoint_path.stem.removeprefix("chkpnt")
-        if suffix.isdigit() and checkpoint_path.stat().st_size > 0:
-            iteration = int(suffix)
-            if iteration <= total_iterations:
-                candidates.append((iteration, checkpoint_path))
-    return max(candidates, default=None, key=lambda item: item[0])
-
-
 def build_train_command(
     python_bin: str,
     scene_dir: Path,
@@ -399,55 +389,23 @@ def run_center150_scene(
         print(f"[Skip] Completed center150 training: {scene_name}")
         return
 
-    latest_checkpoint = find_latest_checkpoint(model_path, total_iterations)
-    if latest_checkpoint is None or latest_checkpoint[0] < total_iterations:
-        train_cmd = build_train_command(
-            python_bin,
-            scene_dir,
-            model_path,
-            total_iterations,
-            force_rand_pcd,
-        )
-        save_iterations = tuple(sorted(set(evaluation_iterations + (total_iterations,))))
-        train_cmd.extend(["--test_iterations", *map(str, evaluation_iterations)])
-        train_cmd.extend(["--save_iterations", *map(str, save_iterations)])
-        train_cmd.extend(["--checkpoint_iterations", *map(str, save_iterations)])
-        train_cmd.append("--full_eval_metrics")
-        if latest_checkpoint is not None:
-            print(f"[Resume] {scene_name} from iteration {latest_checkpoint[0]}")
-            train_cmd.extend(["--start_checkpoint", str(latest_checkpoint[1])])
-        run_command(train_cmd)
-    else:
-        print(f"[Resume] Training already reached iteration {latest_checkpoint[0]}: {scene_name}")
+    if model_path.exists():
+        if model_path.is_symlink() or not model_path.is_dir():
+            raise RuntimeError(f"Refusing to reset invalid center150 output path: {model_path}")
+        print(f"[Restart] Removing incomplete center150 result: {scene_name}")
+        shutil.rmtree(model_path)
 
-    for iteration in evaluation_iterations:
-        if iteration_artifacts_complete(model_path, scene_dir, iteration):
-            continue
-        try:
-            parse_training_time(model_path / f"training_time_{iteration}.txt")
-        except (OSError, ValueError) as exc:
-            raise RuntimeError(
-                f"Cannot recover training time at iteration {iteration}: {model_path}"
-            ) from exc
-        point_cloud = model_path / "point_cloud" / f"iteration_{iteration}" / "point_cloud.ply"
-        if not point_cloud.is_file() or point_cloud.stat().st_size == 0:
-            raise RuntimeError(
-                f"Cannot recover evaluation at iteration {iteration}; missing point cloud: {point_cloud}"
-            )
-        run_command(
-            [
-                python_bin,
-                "render.py",
-                "-m",
-                str(model_path),
-                "--iteration",
-                str(iteration),
-                "--eval",
-                "-r",
-                "1",
-                "--skip_train",
-            ]
-        )
+    train_cmd = build_train_command(
+        python_bin,
+        scene_dir,
+        model_path,
+        total_iterations,
+        force_rand_pcd,
+    )
+    train_cmd.extend(["--test_iterations", *map(str, evaluation_iterations)])
+    train_cmd.extend(["--save_iterations", str(total_iterations)])
+    train_cmd.append("--full_eval_metrics")
+    run_command(train_cmd)
 
     for iteration in evaluation_iterations:
         ensure_novel_view_metrics(model_path, scene_dir, iteration, metric_evaluator)

@@ -82,9 +82,9 @@
   3. 普通模式循环结束后，脚本调用 `metric.py` 汇总最终迭代指标。
 - `center150` 使用独立协议：
   1. 默认优化到 10000 次，在 1000、5000、10000 次迭代分别评估 18 个 target 视角，并同时报告全部 18 路（12 路相邻时刻新视角 + 6 路输入视角）和前 12 路新视角的 PSNR、SSIM、LPIPS 均值，以及累计训练耗时。
-  2. 每个评估点保存同名的 `renders/` 与 `gt/` 图像；原有 `metrics_<iteration>.txt` 继续记录 18 路均值，新增 `metrics_novel_12_<iteration>.txt` 记录按 `transforms_test.json` 顺序选取的前 12 路新视角均值，同时保存 `training_time_<iteration>.txt`、点云和 checkpoint。
+  2. 每个评估点保存同名的 `renders/` 与 `gt/` 图像；原有 `metrics_<iteration>.txt` 继续记录 18 路均值，新增 `metrics_novel_12_<iteration>.txt` 记录按 `transforms_test.json` 顺序选取的前 12 路新视角均值，同时保存 `training_time_<iteration>.txt`。样本内不保存 checkpoint，点云权重仅保留最终迭代的 `point_cloud.ply`；1k/5k/10k 三阶段实验结果全部保留。
   3. 对于新训练，评估循环还会写入 `metrics_per_view_<iteration>.json`，逐项记录 18 个视角的顺序、图像名、`novel/context` 身份及 PSNR、SSIM、LPIPS。后续如需按其他视角范围统计，可以直接从该文件重新聚合，无需重新训练或渲染。
-  4. 训练耗时按纯优化时间累计，不包含评估、点云保存和 checkpoint I/O；累计值写入 checkpoint，断点续跑后继续累加。
+  4. 训练耗时按纯优化时间累计，不包含评估和最终点云保存 I/O。由于单样本训练耗时较短，未完成样本不做样本内断点续跑，下次运行时删除该样本的不完整实验目录并从 0 开始；独立的预处理缓存仍会复用。
   5. 每个样本完成后写入 `center150_complete.json`。再次运行时会按当前参数核验最终点云、各评估点指标、训练耗时以及 render/GT 文件名集合；训练已完成但缺少 12 路指标的旧实验不会重新训练或渲染，只从既有图像补算新视角指标，且不会改写 `training_time_<iteration>.txt`。
   6. 150 个样本全部完成后生成 `center150_metrics_summary.json` 和 `center150_metrics_summary.txt`。逐样本完成文件和最终汇总均同时包含 `all_18_views` 与 `novel_12_views`；为兼容已有分析代码，原有扁平 PSNR、SSIM、LPIPS 字段仍表示 18 路均值。
 - 由于流程已覆盖预处理与训练，**不再设计拆分阶段或 `--only-prepare` 等选项**；脚本会在内部自动处理“已有缓存则跳过生成、否则即时生成”的逻辑，确保一次命令即可完成完整实验。
@@ -112,7 +112,7 @@
 conda run -n DropGaussian python scripts/run_omniscene.py
 ```
 
-默认实验目录为 `output/omniscene_center150_112x200/`。命令可安全重复执行：预处理缓存会复用，已经完整的样本会跳过，未完成样本优先从最近 checkpoint 继续；只有 150 个样本都通过完整性校验后才会生成最终汇总。
+默认实验目录为 `output/omniscene_center150_112x200/`。命令可安全重复执行：预处理缓存会复用，已经完整的样本会快速跳过，未完成样本从 0 开始重新训练；只有 150 个样本都通过完整性校验后才会生成最终汇总。
 
 如需覆写协议，可显式传参，例如：
 
@@ -123,4 +123,4 @@ conda run -n DropGaussian python scripts/run_omniscene.py \
   --eval-iterations 1000 5000 10000 20000
 ```
 
-非默认的总迭代数或评估点会自动写入实验目录名，避免与默认协议的 checkpoint 和指标混用。
+非默认的总迭代数或评估点会自动写入实验目录名，避免与默认协议的权重和指标混用。
